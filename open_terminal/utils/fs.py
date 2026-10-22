@@ -13,15 +13,176 @@ so that files belong to the provisioned user, not the server process.
 
 import asyncio
 import os
+import io
+import json
+import re
+import tempfile
 import shutil
 import subprocess
+from itertools import groupby
 
 import aiofiles
 import aiofiles.os
+from starlette.responses import FileResponse
 
-from open_terminal.utils.limits import LINE_BREAKS, LineBudget
+from open_terminal.env import MAX_TOOL_OUTPUT_SIZE
+from open_terminal.utils.limits import CHUNK_SIZE, escaped_bytes, run_io, truncate_escaped
 
-READ_CHUNK_SIZE = 64 * 1024
+
+class FullFileResponse(FileResponse):
+    """Stream the original full response without adding HTTP range/cache semantics."""
+
+    def set_stat_headers(self, stat_result):
+        self.headers.setdefault("content-length", str(stat_result.st_size))
+
+    async def __call__(self, scope, receive, send):
+        if "accept-ranges" in self.headers:
+            del self.headers["accept-ranges"]
+        scope = {**scope, "headers": [(key, value) for key, value in scope.get("headers", []) if key.lower() not in (b"range", b"if-range")]}
+        await super().__call__(scope, receive, send)
+
+
+class TemporaryFileResponse(FullFileResponse):
+    """Remove generated files even when sending the response is cancelled."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+
+
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+_LINE_END = re.compile(f"(?:{_LINE_BREAK.pattern})\\Z")
+
+
+def line_range_offsets(text, start_line=None, end_line=None):
+    start_boundary = (start_line or 1) - 1
+    start = 0 if start_boundary == 0 else len(text)
+    end = len(text)
+    last_boundary = max(start_boundary, end_line or 0)
+    if last_boundary:
+        for number, match in enumerate(_LINE_BREAK.finditer(text), 1):
+            if number == start_boundary:
+                start = match.end()
+            if number == end_line:
+                end = match.end()
+            if number >= last_boundary:
+                break
+    return start, end
+
+
+def text_chunks(source):
+    """Yield splitlines-compatible line numbers and bounded pieces of text."""
+    number = 1
+    pending = ""
+    for chunk in iter(lambda: source.read(CHUNK_SIZE), ""):
+        chunk = pending + chunk
+        pending = "\r" if chunk.endswith("\r") else ""
+        if pending:
+            chunk = chunk[:-1]
+        start = 0
+        for match in _LINE_BREAK.finditer(chunk):
+            end = match.end()
+            yield number, chunk[start:end]
+            number += 1
+            start = end
+        if start < len(chunk):
+            yield number, chunk[start:]
+    if pending:
+        yield number, pending
+
+
+def read_text_range(path, start_line=None, end_line=None):
+    selected = io.StringIO()
+    total = 0
+    with open(path, encoding="utf-8") as source:
+        for total, chunk in text_chunks(source):
+            if total >= (start_line or 1) and (end_line is None or total <= end_line):
+                selected.write(chunk)
+    return {"total_lines": total, "content": selected.getvalue()}
+
+
+def _text_response_end(total_lines: int, returned_lines: int, next_line: int | None, cut_line: dict | None) -> str:
+    """Fields that close a read_file response, after its content."""
+    fields = {"total_lines": total_lines, "returned_lines": returned_lines, "truncated": bool(next_line or cut_line)}
+    if cut_line:
+        # Only continuing inside the cut line keeps its rest, so next_line is withheld.
+        fields.update(cut_line)
+    elif next_line:
+        fields["next_line"] = next_line
+    return '",' + json.dumps(fields)[1:]
+
+
+_LARGEST_NUMBER = 9_999_999_999
+_TEXT_END_SIZE = len(_text_response_end(_LARGEST_NUMBER, _LARGEST_NUMBER, None, {
+    "line_truncated": True, "start_line": _LARGEST_NUMBER, "line_offset": _LARGEST_NUMBER, "line_length": _LARGEST_NUMBER,
+}))
+
+
+def _build_text_file_response(path, display_path, start_line=None, end_line=None, normalize_newlines=True, line_offset: int = 0):
+    """Build the JSON response on disk, cut at the tool output limit."""
+    start_line = start_line or 1
+    fd, temporary = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as output, open(path, encoding="utf-8", newline=None if normalize_newlines else "") as source:
+            head = '{"path":' + json.dumps(display_path) + ',"content":"'
+            output.write(head)
+            budget = max(MAX_TOOL_OUTPUT_SIZE - len(head) - _TEXT_END_SIZE, MAX_TOOL_OUTPUT_SIZE // 4)
+            used = returned_lines = total = 0
+            next_line = cut_line = None
+            for total, pieces in groupby(text_chunks(source), key=lambda item: item[0]):
+                if next_line or cut_line or total < start_line or (end_line is not None and total > end_line):
+                    continue
+                kept, kept_size, line_length, overflows = [], 0, 0, False
+                skip = line_offset if total == start_line else 0
+                for _, piece in pieces:
+                    ending = _LINE_END.search(piece)
+                    line_length += len(piece) - (len(ending.group()) if ending else 0)
+                    if skip:
+                        skipped = min(skip, len(piece))
+                        piece, skip = piece[skipped:], skip - skipped
+                    if overflows:
+                        continue
+                    size = escaped_bytes(piece)
+                    if used + kept_size + size > budget:
+                        overflows = True
+                        if not returned_lines:
+                            kept.append(truncate_escaped(piece, budget - used - kept_size))
+                        continue
+                    kept.append(piece)
+                    kept_size += size
+                if overflows and returned_lines:
+                    next_line = total
+                    continue
+                text = "".join(kept)
+                output.write(json.dumps(text, ensure_ascii=False)[1:-1])
+                used += kept_size
+                returned_lines += 1
+                if overflows:
+                    cut_line = {"line_truncated": True, "start_line": total, "line_offset": line_offset + len(text), "line_length": line_length}
+            output.write(_text_response_end(total, returned_lines, next_line, cut_line))
+        return TemporaryFileResponse(temporary, media_type="application/json")
+    except BaseException:
+        os.unlink(temporary)
+        raise
+
+
+async def text_file_response(*args):
+    task = asyncio.create_task(asyncio.to_thread(_build_text_file_response, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            response = await task
+        except Exception:
+            pass
+        else:
+            os.unlink(response.path)
+        raise
 
 
 class UserFS:
@@ -160,83 +321,6 @@ class UserFS:
         async with aiofiles.open(path, "r", encoding=encoding, errors="strict") as f:
             return await f.read()
 
-    async def read_lines(
-        self,
-        path: str,
-        start_line: int = 1,
-        end_line: int | None = None,
-        line_offset: int = 0,
-        reserved: int = 0,
-        encoding: str = "utf-8",
-    ) -> dict:
-        """Read a line range without holding the whole file in memory.
-
-        Reading starts *line_offset* characters into *start_line*, so a line
-        that was cut short by the byte budget can be continued, and *reserved*
-        is the room the rest of the response needs. Returns ``content``,
-        ``total_lines``, ``returned_lines``, ``truncated`` (the range was cut
-        short), ``line_truncated`` (a single line was cut) and ``line_length``
-        (how long that line is in full).
-        """
-        self._check_path(path)
-        return await asyncio.to_thread(
-            self._read_lines, path, start_line, end_line, line_offset, reserved, encoding
-        )
-
-    def _read_lines(
-        self,
-        path: str,
-        start_line: int,
-        end_line: int | None,
-        line_offset: int,
-        reserved: int,
-        encoding: str,
-    ) -> dict:
-        budget = LineBudget(reserved)
-        line_number = 0
-        line_length = 0
-        partial = ""
-        unterminated = False
-        skipped_chars = 0
-        skip = line_offset
-
-        def take(line: str) -> None:
-            nonlocal line_length
-            if line_number < start_line:
-                return
-            if end_line is not None and line_number > end_line:
-                return
-            # take() keeps running to finish total_lines, so only the first
-            # cut line sets line_length.
-            was_cut = budget.line_truncated
-            budget.add(line[skip:] if line_number == start_line else line)
-            if budget.line_truncated and not was_cut:
-                line_length = len(line.rstrip(LINE_BREAKS)) + skipped_chars
-
-        with open(path, "r", encoding=encoding, errors="strict") as f:
-            while True:
-                chunk = f.read(READ_CHUNK_SIZE)
-                if not chunk:
-                    break
-                lines = (partial + chunk).splitlines(keepends=True)
-                partial = "" if lines[-1][-1:] in LINE_BREAKS else lines.pop()
-                unterminated = bool(partial)
-                for line in lines:
-                    line_number += 1
-                    take(line)
-                    skipped_chars = 0
-                if line_number + 1 == start_line and skip:
-                    head = min(skip, len(partial))
-                    partial = partial[head:]
-                    skip -= head
-                    skipped_chars += head
-                partial, clipped = budget.clip(partial)
-                skipped_chars += clipped
-        if unterminated:
-            line_number += 1
-            take(partial)
-        return {**budget.result(), "total_lines": line_number, "line_length": line_length}
-
     async def exists(self, path: str) -> bool:
         """Check if *path* exists."""
         self._check_path(path)
@@ -273,7 +357,7 @@ class UserFS:
             pass
         try:
             return os.access(path, os.W_OK, effective_ids=True)
-        except TypeError:
+        except (TypeError, OSError, NotImplementedError, AttributeError):
             return os.access(path, os.W_OK)
 
     async def is_writable(self, path: str) -> bool:
@@ -301,7 +385,7 @@ class UserFS:
                 except OSError:
                     continue
             return entries
-        return await asyncio.to_thread(_list_sync)
+        return await run_io(_list_sync)
 
     async def walk(self, path: str) -> list[tuple[str, list[str], list[str]]]:
         """Walk directory tree. Returns list of (dirpath, dirnames, filenames).
@@ -325,7 +409,7 @@ class UserFS:
                 ]
                 result.append((dirpath, dirnames, filenames))
             return result
-        return await asyncio.to_thread(_walk_filtered)
+        return await run_io(_walk_filtered)
 
     # ------------------------------------------------------------------
     # Write operations (native Python + chown for correct ownership)

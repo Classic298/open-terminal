@@ -1,6 +1,6 @@
 [project]
 name = "open-terminal"
-version = "0.13.0"
+version = "0.14.2"
 description = "A remote terminal API."
 license = "MIT"
 readme = "README.md"
@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["fastmcp>=2.0.0"]
+mcp = ["fastmcp>=4.0.0"]
 
 [project.scripts]
 open-terminal = "open_terminal.cli:main"

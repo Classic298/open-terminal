@@ -1,12 +1,101 @@
-"""Byte budgets for model-facing tool responses."""
+"""Streaming I/O helpers with cancellation-safe resource cleanup."""
 
+import asyncio
 import json
+import os
+
+from fastapi import HTTPException
 
 from open_terminal.env import MAX_TOOL_OUTPUT_SIZE
 
-# Everything splitlines() treats as a line break, which is how line numbers
-# have always been counted here.
-LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+CHUNK_SIZE = 64 * 1024
+
+
+async def run_io(function, *args):
+    """Keep admission/cleanup ownership until a cancelled thread actually stops."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            pass
+        raise
+
+
+class NormalizeNullQueryMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            from urllib.parse import parse_qsl, urlencode
+            params = parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+            cleaned = [(key, value) for key, value in params if value.lower() != "null"]
+            if len(cleaned) != len(params):
+                scope = {**scope, "query_string": urlencode(cleaned).encode()}
+        await self.app(scope, receive, send)
+
+
+async def run_worker(command, payload=None, *, request=None, timeout=60, **options):
+    """Run document work with cancellation and process-group cleanup."""
+    import signal
+    import subprocess
+
+    process = await asyncio.create_subprocess_exec(
+        *command, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=subprocess.DEVNULL,
+        start_new_session=os.name != "nt", **options,
+    )
+
+    async def exchange():
+        if payload:
+            process.stdin.write(payload)
+            await process.stdin.drain()
+        process.stdin.close()
+        output = bytearray()
+        while chunk := await process.stdout.read(CHUNK_SIZE):
+            output.extend(chunk)
+        await process.wait()
+        if process.returncode:
+            raise HTTPException(422, "Document worker failed. Check that the document libraries are installed and the files are readable.")
+        return bytes(output)
+
+    async def disconnected():
+        while (await request.receive())["type"] != "http.disconnect":
+            pass
+
+    task = asyncio.create_task(exchange())
+    disconnect = asyncio.create_task(disconnected()) if request else None
+    try:
+        done, _ = await asyncio.wait(
+            {task, disconnect} if disconnect else {task},
+            timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise HTTPException(408, "Document operation exceeded its execution deadline.")
+        if disconnect and disconnect in done:
+            raise HTTPException(499, "Document operation cancelled.")
+        return await task
+    finally:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        elif process.returncode is None:
+            process.kill()
+        task.cancel()
+        if disconnect:
+            disconnect.cancel()
+        await asyncio.gather(*([task, disconnect] if disconnect else [task]), return_exceptions=True)
+        process.stdin.close()
+        # A paused stdout transport can keep Process.wait() pending even
+        # after SIGKILL. Discard remaining bounded pipe chunks before reaping.
+        while await process.stdout.read(CHUNK_SIZE):
+            pass
+        await process.wait()
 
 
 def json_bytes(payload: object) -> int:
@@ -39,8 +128,6 @@ def excerpt_around(text: str, index: int, max_bytes: int) -> tuple[str, bool]:
     """Bounded window of *text* around the match at character *index*."""
     if len(text) <= max_bytes and len(text.encode("utf-8")) <= max_bytes:
         return text, False
-    # A character is never fewer than one byte, so this window holds every
-    # byte the excerpt could need without encoding the whole line.
     window_start = max(0, index - max_bytes)
     window = text[window_start : index + max_bytes].encode("utf-8")
     match_start = len(text[window_start:index].encode("utf-8"))
@@ -48,91 +135,16 @@ def excerpt_around(text: str, index: int, max_bytes: int) -> tuple[str, bool]:
     return window[start : start + max_bytes].decode("utf-8", errors="ignore"), True
 
 
-class LineBudget:
-    """Collects lines until the tool output budget is spent.
-
-    Lines are charged at their JSON-escaped size, and *reserved* is the room
-    the rest of the response needs, so the budget covers the whole body. A
-    line that exceeds the budget on its own is cut, so a file consisting of
-    one very long line still returns something useful.
-    """
-
-    def __init__(self, reserved: int = 0):
-        # A response whose own fields eat most of the limit still returns a
-        # useful chunk, rather than a character at a time forever.
-        self.limit = max(MAX_TOOL_OUTPUT_SIZE - reserved, MAX_TOOL_OUTPUT_SIZE // 4)
-        self.lines: list[str] = []
-        self.used = 0
-        self.returned_lines = 0
-        self.truncated = False
-        self.line_truncated = False
-
-    def add(self, line: str) -> bool:
-        """Append *line*. Returns ``False`` once the budget is spent."""
-        if self.truncated:
-            return False
-        size = escaped_bytes(line)
-        if self.used + size > self.limit:
-            self.truncated = True
-            if not self.lines:
-                text = truncate_escaped(line, self.limit)
-                self.lines.append(text)
-                self.returned_lines = 1
-                self.line_truncated = True
-            return False
-        self.lines.append(line)
-        self.used += size
-        self.returned_lines += 1
-        return True
-
-    def clip(self, text: str) -> tuple[str, int]:
-        """Cut *text* to what could still be returned, and by how much.
-
-        One character past the limit, so a line too long to return whole stays
-        over budget and is reported as cut rather than looking complete.
-        """
-        keep_chars = self.limit + 1
-        if len(text) <= keep_chars:
-            return text, 0
-        return text[:keep_chars], len(text) - keep_chars
-
-    def result(self) -> dict:
-        """The collected lines and how the budget cut them short."""
-        return {
-            "content": "".join(self.lines),
-            "returned_lines": self.returned_lines,
-            "truncated": self.truncated,
-            "line_truncated": self.line_truncated,
-        }
-
-
-def fit_lines(lines: list[str], start: int, end: int, line_offset: int, reserved: int) -> dict:
-    """Collect an already split line range under the byte budget."""
-    budget = LineBudget(reserved)
-    line_length = 0
-    for position, line in enumerate(lines[start:end]):
-        if not budget.add(line[line_offset:] if position == 0 else line):
-            if budget.line_truncated:
-                line_length = len(line.rstrip(LINE_BREAKS))
-            break
-    return {**budget.result(), "total_lines": len(lines), "line_length": line_length}
-
-
-def fit_items(payload: dict, key: str, *, keep_last: bool = False) -> int:
-    """Drop items from ``payload[key]`` until *payload* fits the byte budget.
-
-    Keeps the first items, or the last ones when *keep_last* is set (process
-    output, where the newest entries matter). One item that exceeds the budget
-    on its own is kept, so a cursor always advances. Returns the number dropped.
-    """
+def fit_items(payload: dict, key: str) -> int:
+    """Drop items from the end of ``payload[key]`` until *payload* fits the limit; returns how many."""
     items = payload[key]
     payload[key] = []
     used = json_bytes(payload)
     kept = []
-    for item in reversed(items) if keep_last else items:
+    for item in items:
         used += json_bytes(item) + (1 if kept else 0)
         if used > MAX_TOOL_OUTPUT_SIZE and kept:
             break
         kept.append(item)
-    payload[key] = kept[::-1] if keep_last else kept
+    payload[key] = kept
     return len(items) - len(kept)
